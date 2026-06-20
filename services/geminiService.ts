@@ -88,7 +88,7 @@ export const generateGameLevel = async (customTheme?: string): Promise<WordLevel
       if (masterWord && masterWord.length >= 6) {
         // Automatically solve it locally with our 1,500-word vocabulary to guarantee
         // the client has a 100% accurate, cheat-proof, instantly verifiable array of subwords!
-        const subWords = solveAtomicLevel(masterWord);
+        const subWords = await solveAtomicLevel(masterWord);
         
         // If our solver finds too few words, we fallback to ensure excellent gameplay
         if (subWords.length >= 8) {

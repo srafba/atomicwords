@@ -2,7 +2,8 @@
  * Offline Word Level Data and Solver for Atomic Words
  */
 
-import { solveAnagrams, getMinWordLength } from "./dictionaryService";
+import { getMinWordLength } from "./dictionaryService";
+import { solveAnagramsAsync } from "./workerService";
 
 export interface WordLevel {
   masterWord: string;
@@ -104,27 +105,29 @@ export const OFFLINE_LEVELS: WordLevel[] = [
   }
 ];
 
-/// Clean, fast solver using our newly added offline English dictionary
-export function solveAtomicLevel(master: string): string[] {
-  // Respect the active configured minimum word length
+/**
+ * Async solver — runs off the main thread via the Web Worker.
+ * Respects the active configured minimum word length.
+ */
+export async function solveAtomicLevel(master: string): Promise<string[]> {
   const minLength = getMinWordLength();
-  return solveAnagrams(master, minLength);
+  return solveAnagramsAsync(master, minLength);
 }
 
 /**
- * Get a random scientific/atomic themed WordLevel, fully populated with the active dictionary
+ * Get a random scientific/atomic themed WordLevel, fully populated with the active dictionary.
+ * Async because the solver now runs in a Web Worker.
  */
-export function getRandomLevel(): WordLevel {
+export async function getRandomLevel(): Promise<WordLevel> {
   const base = OFFLINE_LEVELS[Math.floor(Math.random() * OFFLINE_LEVELS.length)];
-  const generatedSubwords = solveAtomicLevel(base.masterWord);
-  
-  // Combine pre-solved and dynamically decoded dictionary words
+  const generatedSubwords = await solveAtomicLevel(base.masterWord);
+
+  // Merge pre-solved seed words with dynamically solved words
   const minLength = getMinWordLength();
   const subWordsSet = new Set([
-    ...base.subWords.filter(w => w.length >= minLength), 
+    ...base.subWords.filter(w => w.length >= minLength),
     ...generatedSubwords
   ]);
-  
   return {
     ...base,
     subWords: Array.from(subWordsSet).sort((a, b) => b.length - a.length || a.localeCompare(b))

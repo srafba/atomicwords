@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { User, Difficulty, Language, AvatarConfig } from './types';
 import * as GeminiService from './services/geminiService';
 import * as StorageService from './services/storageService';
@@ -12,9 +12,9 @@ import { ShopScreen } from './components/ShopScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { HowToPlayScreen } from './components/HowToPlayScreen';
 import { DeveloperModeScreen } from './components/DeveloperModeScreen';
-import { 
-  getMinWordLength, 
-  solveAnagrams, 
+import { solveAnagramsAsync } from './services/workerService';
+import {
+  getMinWordLength,
   canWordBeFormed, 
   isWordInDictionary,
   startBackgroundDictionaryLoad,
@@ -243,6 +243,19 @@ const GamePlayScreen: React.FC<PlayProps> = ({
   const [capsuleWord, setCapsuleWord] = useState('');
   const [scienceCapsule, setScienceCapsule] = useState('');
   const [capsuleLoading, setCapsuleLoading] = useState(false);
+  // Cache capsule responses per word so clicking an already-fetched word chip is instant
+  const capsuleCache = useRef<Map<string, string>>(new Map());
+
+  // Debounced game-progress localStorage write — batches saves to at most once per 800ms
+  const progressSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveProgressDebounced = (progress: object) => {
+    if (progressSaveTimer.current) clearTimeout(progressSaveTimer.current);
+    progressSaveTimer.current = setTimeout(() => {
+      try {
+        localStorage.setItem('atomic_active_game_progress', JSON.stringify(progress));
+      } catch (_) {}
+    }, 800);
+  };
 
   const [isValidatingWord, setIsValidatingWord] = useState(false);
 
@@ -280,16 +293,15 @@ const GamePlayScreen: React.FC<PlayProps> = ({
       const newRoundId = "rnd_" + Math.random().toString(36).substring(2, 11) + "_" + Date.now();
       setRoundId(newRoundId);
 
-      // Save initial state to local storage
-      const initialProgress = {
+      // Save initial state to local storage (debounced)
+      saveProgressDebounced({
         roundId: newRoundId,
         masterWord: gameLevel.masterWord,
         foundWords: [],
         score: 0,
         timeLeft: 90,
         coinsEarned: 0
-      };
-      localStorage.setItem('atomic_active_game_progress', JSON.stringify(initialProgress));
+      });
 
       // Split master word into distinct interactive tiles
       const formattedTiles = gameLevel.masterWord.split('').map((char, index) => ({
@@ -349,15 +361,9 @@ const GamePlayScreen: React.FC<PlayProps> = ({
     setTiles(prev => [...prev].sort(() => Math.random() - 0.5));
   };
 
-  // Safeguard: Ensure all elements in foundWords can actually be formed from the current level's masterWord
-  useEffect(() => {
-    if (!level || !level.masterWord) return;
-    const invalidWords = foundWords.filter(w => !canWordBeFormed(w, level.masterWord));
-    if (invalidWords.length > 0) {
-      console.warn("Safeguard triggered: foundWords contained invalid anagrams. Cleaning up:", invalidWords);
-      setFoundWords(prev => prev.filter(w => canWordBeFormed(w, level.masterWord)));
-    }
-  }, [level?.masterWord, foundWords, level, setFoundWords]);
+  // NOTE: The foundWords safeguard useEffect was removed — canWordBeFormed is already
+  // checked at submit time in handleSubmitSpelling, so re-checking on every state update
+  // was redundant O(N) work per word found.
 
   // Submit Spelled Trial
   const handleSubmitSpelling = async () => {
@@ -438,30 +444,33 @@ const GamePlayScreen: React.FC<PlayProps> = ({
     setCoinsEarned(updatedCoinsEarned);
     setFoundWords(updatedFoundWords);
 
-    // Save progress update in localstorage dynamically
-    try {
-      const currentProgress = {
-        roundId,
-        masterWord: level.masterWord,
-        foundWords: updatedFoundWords,
-        score: updatedScore,
-        timeLeft,
-        coinsEarned: updatedCoinsEarned
-      };
-      localStorage.setItem('atomic_active_game_progress', JSON.stringify(currentProgress));
-    } catch (e) {}
-
-    // Launch word info from Gemini
-    setCapsuleWord(word);
-    setScienceCapsule('');
-    setCapsuleLoading(true);
-    
-    GeminiService.getWordScienceCapsule(word, level.masterWord).then(capsuleText => {
-      setScienceCapsule(capsuleText);
-      setCapsuleLoading(false);
-    }).catch(() => {
-      setCapsuleLoading(false);
+    // Save progress update (debounced — batches rapid word finds into one write)
+    saveProgressDebounced({
+      roundId,
+      masterWord: level.masterWord,
+      foundWords: updatedFoundWords,
+      score: updatedScore,
+      timeLeft,
+      coinsEarned: updatedCoinsEarned
     });
+
+    // Launch word info from Gemini (served from cache if already fetched)
+    setCapsuleWord(word);
+    const cached = capsuleCache.current.get(word);
+    if (cached) {
+      setScienceCapsule(cached);
+      setCapsuleLoading(false);
+    } else {
+      setScienceCapsule('');
+      setCapsuleLoading(true);
+      GeminiService.getWordScienceCapsule(word, level.masterWord).then(capsuleText => {
+        capsuleCache.current.set(word, capsuleText);
+        setScienceCapsule(capsuleText);
+        setCapsuleLoading(false);
+      }).catch(() => {
+        setCapsuleLoading(false);
+      });
+    }
 
     // Automatically empty spelling tray
     setTiles(prev => prev.map(t => ({ ...t, used: false })));
@@ -500,30 +509,33 @@ const GamePlayScreen: React.FC<PlayProps> = ({
         setCoinsEarned(updatedCoinsEarned);
         setFoundWords(updatedFoundWords);
         
-        // Save progress update in localstorage dynamically
-        try {
-          const currentProgress = {
-            roundId,
-            masterWord: level.masterWord,
-            foundWords: updatedFoundWords,
-            score: updatedScore,
-            timeLeft,
-            coinsEarned: updatedCoinsEarned
-          };
-          localStorage.setItem('atomic_active_game_progress', JSON.stringify(currentProgress));
-        } catch (e) {}
-        
-        // Launch word info from Gemini
-        setCapsuleWord(wordToReport);
-        setScienceCapsule('');
-        setCapsuleLoading(true);
-        
-        GeminiService.getWordScienceCapsule(wordToReport, level.masterWord).then(capsuleText => {
-          setScienceCapsule(capsuleText);
-          setCapsuleLoading(false);
-        }).catch(() => {
-          setCapsuleLoading(false);
+        // Save progress update (debounced)
+        saveProgressDebounced({
+          roundId,
+          masterWord: level.masterWord,
+          foundWords: updatedFoundWords,
+          score: updatedScore,
+          timeLeft,
+          coinsEarned: updatedCoinsEarned
         });
+        
+        // Launch word info from Gemini (served from cache if already fetched)
+        setCapsuleWord(wordToReport);
+        const cachedReport = capsuleCache.current.get(wordToReport);
+        if (cachedReport) {
+          setScienceCapsule(cachedReport);
+          setCapsuleLoading(false);
+        } else {
+          setScienceCapsule('');
+          setCapsuleLoading(true);
+          GeminiService.getWordScienceCapsule(wordToReport, level.masterWord).then(capsuleText => {
+            capsuleCache.current.set(wordToReport, capsuleText);
+            setScienceCapsule(capsuleText);
+            setCapsuleLoading(false);
+          }).catch(() => {
+            setCapsuleLoading(false);
+          });
+        }
         
       } else {
         logUserComplaint(wordToReport);
@@ -713,12 +725,19 @@ const GamePlayScreen: React.FC<PlayProps> = ({
                 onClick={() => {
                   playSound('click');
                   setCapsuleWord(word);
-                  setScienceCapsule('');
-                  setCapsuleLoading(true);
-                  GeminiService.getWordScienceCapsule(word, level.masterWord).then(capsuleText => {
-                    setScienceCapsule(capsuleText);
+                  const cachedChip = capsuleCache.current.get(word);
+                  if (cachedChip) {
+                    setScienceCapsule(cachedChip);
                     setCapsuleLoading(false);
-                  });
+                  } else {
+                    setScienceCapsule('');
+                    setCapsuleLoading(true);
+                    GeminiService.getWordScienceCapsule(word, level.masterWord).then(capsuleText => {
+                      capsuleCache.current.set(word, capsuleText);
+                      setScienceCapsule(capsuleText);
+                      setCapsuleLoading(false);
+                    });
+                  }
                 }}
                 className="px-2.5 py-1 bg-blue-500/5 hover:bg-blue-500/10 text-blue-600 dark:text-blue-400 text-xs font-black rounded-lg uppercase tracking-wider transition-all flex items-center gap-1"
               >
@@ -958,17 +977,13 @@ export default function App() {
   const [roundId, setRoundId] = useState<string>('');
   const [totalDictionarySize, setTotalDictionarySize] = useState(getLoadedDictionarySize());
 
-  // Re-solves the level on settings changes (such as custom word importers or toggling min lengths)
+  // Re-solves the level on settings changes (dictionary import, min-length toggle).
+  // Runs the solver in the Web Worker — never blocks the UI thread.
   const handleForceSolveLevel = () => {
     if (!level) return;
-    setLevel(prev => {
-      if (!prev) return null;
-      const minLen = getMinWordLength();
-      const updatedSub = solveAnagrams(prev.masterWord, minLen);
-      return {
-        ...prev,
-        subWords: updatedSub
-      };
+    const minLen = getMinWordLength();
+    solveAnagramsAsync(level.masterWord, minLen).then(updatedSub => {
+      setLevel(prev => prev ? { ...prev, subWords: updatedSub } : null);
     });
   };
 

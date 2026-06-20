@@ -1,12 +1,54 @@
 import { dictionary as DEFAULT_DICTIONARY } from './dictionary';
 import { GoogleGenAI } from "@google/genai";
+import { updateWorkerLargeDictionary, updateWorkerCustomDictionary } from './workerService';
 
 const STORAGE_CUSTOM_DICT_KEY = 'atomic_custom_dictionary';
 const STORAGE_MIN_LEN_KEY = 'atomic_min_word_length';
 const STORAGE_ANALYTICS_KEY = 'atomic_dict_analytics';
 
-// In-Memory storage for the parsed large production dictionary loaded from external repo
+// --- Stable module-level Sets (built once, never rebuilt on lookups) ---
+
+/** Default dictionary as a Set — built once at module load time. */
+const defaultDictionarySet: Set<string> = new Set(DEFAULT_DICTIONARY);
+
+/** Large CDN Scrabble dictionary (~270k words), populated after async load. */
 let largeDictionarySet: Set<string> = new Set();
+
+/** In-memory cache for the custom dictionary. null = not yet loaded from localStorage. */
+let customDictionaryCache: string[] | null = null;
+/** Set view of customDictionaryCache for O(1) lookups. */
+let customDictionarySet: Set<string> | null = null;
+
+/** Invalidate the custom dictionary cache (call after import or reset). */
+const invalidateCustomDictionaryCache = () => {
+  customDictionaryCache = null;
+  customDictionarySet = null;
+};
+
+/** Load and cache the custom dictionary from localStorage (once per session or after invalidation). */
+const loadCustomDictionaryCache = (): { arr: string[]; set: Set<string> } => {
+  if (customDictionaryCache !== null && customDictionarySet !== null) {
+    return { arr: customDictionaryCache, set: customDictionarySet };
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_CUSTOM_DICT_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        customDictionaryCache = parsed as string[];
+        customDictionarySet = new Set(customDictionaryCache);
+        return { arr: customDictionaryCache, set: customDictionarySet };
+      }
+    }
+  } catch (e) {
+    console.error("Error reading custom dictionary, fallback to default", e);
+  }
+  // No custom dict — cache the default so we don't re-parse localStorage repeatedly
+  customDictionaryCache = DEFAULT_DICTIONARY;
+  customDictionarySet = defaultDictionarySet;
+  return { arr: customDictionaryCache, set: customDictionarySet };
+};
+
 let dictionaryLoadStatus: "idle" | "loading" | "loaded" | "failed" = "idle";
 let dictionaryUrlsAttemptedCount = 0;
 
@@ -104,6 +146,8 @@ export const startBackgroundDictionaryLoad = async () => {
         largeDictionarySet = parsedSet;
         dictionaryLoadStatus = "loaded";
         console.log(`[DictionaryService] Successfully loaded comprehensive offline dictionary with ${largeDictionarySet.size} global words.`);
+        // Push to the solver worker so it can use the full dictionary off-thread
+        updateWorkerLargeDictionary(Array.from(largeDictionarySet));
         notifyDictionaryListeners(largeDictionarySet.size);
         return;
       }
@@ -118,44 +162,33 @@ export const startBackgroundDictionaryLoad = async () => {
 
 /**
  * Retrieve active baseline dictionary loaded locally, including custom overrides stored in browser.
+ * Returns a cached result — no localStorage read on repeated calls.
  */
 export const getActiveDictionary = (): string[] => {
-  try {
-    const custom = localStorage.getItem(STORAGE_CUSTOM_DICT_KEY);
-    if (custom) {
-      const parsed = JSON.parse(custom);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
-      }
-    }
-  } catch (e) {
-    console.error("Error reading custom dictionary, fallback to default", e);
-  }
-  return DEFAULT_DICTIONARY;
+  return loadCustomDictionaryCache().arr;
 };
 
 /**
- * Check if word list includes the test word, incorporating large dictionaries
+ * Check if word list includes the test word, incorporating large dictionaries.
+ * Uses stable module-level Sets — O(1) per lookup, no allocations.
  */
 export const isWordInAnyDictionary = (w: string): boolean => {
   const word = w.toUpperCase().trim();
   if (!word) return false;
-  
-  // 1. Check loaded background CDN dictionary set (270k+)
-  if (largeDictionarySet.has(word)) return true;
-  
-  // 2. Check local customized imported dictionaries
-  const custom = getActiveDictionary();
-  const customSet = new Set(custom);
-  if (customSet.has(word)) return true;
-  
-  // 3. Check hardcoded standard scientific/atomic default pool
-  const defaultSet = new Set(DEFAULT_DICTIONARY);
-  if (defaultSet.has(word)) return true;
 
-  // 4. Check memory verified fallback cache
+  // 1. Fastest: check the large CDN set first (270k+), already a Set<string>
+  if (largeDictionarySet.has(word)) return true;
+
+  // 2. Check stable default set (built once at module load)
+  if (defaultDictionarySet.has(word)) return true;
+
+  // 3. Check custom dictionary set (cached, built once per session)
+  const { set: customSet } = loadCustomDictionaryCache();
+  if (customSet !== defaultDictionarySet && customSet.has(word)) return true;
+
+  // 4. Check AI-verified word cache
   if (positiveAIWordCache.has(word)) return true;
-  
+
   return false;
 };
 
@@ -199,12 +232,15 @@ export const importCustomDictionary = (rawText: string): { success: boolean; cou
   
   try {
     localStorage.setItem(STORAGE_CUSTOM_DICT_KEY, JSON.stringify(cleanedWords));
-    // Clear validation cache
+    // Invalidate in-memory caches so next lookup re-reads the new list
+    invalidateCustomDictionaryCache();
     positiveAIWordCache.clear();
-    return { 
-      success: true, 
-      count: cleanedWords.length, 
-      message: `Successfully loaded offline dictionary with ${cleanedWords.length} words.` 
+    // Sync custom dict to the solver worker
+    updateWorkerCustomDictionary(cleanedWords);
+    return {
+      success: true,
+      count: cleanedWords.length,
+      message: `Successfully loaded offline dictionary with ${cleanedWords.length} words.`
     };
   } catch (e) {
     return { success: false, count: 0, message: "Storage quota exceeded! List is too large." };
@@ -216,6 +252,7 @@ export const importCustomDictionary = (rawText: string): { success: boolean; cou
  */
 export const resetDictionaryToDefault = () => {
   localStorage.removeItem(STORAGE_CUSTOM_DICT_KEY);
+  invalidateCustomDictionaryCache();
   positiveAIWordCache.clear();
 };
 
@@ -251,8 +288,29 @@ export const isWordInDictionary = (w: string): boolean => {
 };
 
 /**
+ * Tests a single word against a pre-built master frequency map.
+ * Extracted so we can reuse it across multiple Set iterations without closure overhead.
+ */
+const testWordAgainstFreq = (
+  word: string,
+  masterFreq: Record<string, number>,
+  minLength: number,
+  maxLength: number,
+  masterWord: string
+): boolean => {
+  if (word.length < minLength || word.length > maxLength || word === masterWord) return false;
+  const wordFreq: Record<string, number> = {};
+  for (const char of word) {
+    wordFreq[char] = (wordFreq[char] || 0) + 1;
+    if (!masterFreq[char] || wordFreq[char] > masterFreq[char]) return false;
+  }
+  return true;
+};
+
+/**
  * High-Performance offline solver which parses through the loaded dictionary index.
- * Evaluates tens of thousands of words against the master character set and sorts by size.
+ * Evaluates words against the master character set using stable module-level Sets —
+ * no new Set construction, no spreading 270k arrays on every call.
  */
 export const solveAnagrams = (master: string, minLength: number = 3): string[] => {
   const masterWord = master.toUpperCase().trim();
@@ -260,37 +318,36 @@ export const solveAnagrams = (master: string, minLength: number = 3): string[] =
   for (const char of masterWord) {
     masterFreq[char] = (masterFreq[char] || 0) + 1;
   }
-  
-  // Combine all active pools to offer complete solvers
-  const activeSet = new Set([
-    ...DEFAULT_DICTIONARY,
-    ...getActiveDictionary(),
-    ...Array.from(largeDictionarySet)
-  ]);
-  
-  const results: string[] = [];
-  
-  for (const word of activeSet) {
-    if (word.length < minLength || word.length > masterWord.length) continue;
-    if (word === masterWord) continue; // Keep master special
-    
-    const wordFreq: Record<string, number> = {};
-    let isSpellable = true;
-    
-    for (const char of word) {
-      wordFreq[char] = (wordFreq[char] || 0) + 1;
-      if (!masterFreq[char] || wordFreq[char] > masterFreq[char]) {
-        isSpellable = false;
-        break;
-      }
-    }
-    
-    if (isSpellable) {
-      results.push(word);
+
+  const maxLength = masterWord.length;
+  const resultSet = new Set<string>(); // deduplicate across dictionary sources
+
+  // Iterate each stable Set directly — no spreading, no allocations
+  const { set: customSet } = loadCustomDictionaryCache();
+
+  for (const word of defaultDictionarySet) {
+    if (testWordAgainstFreq(word, masterFreq, minLength, maxLength, masterWord)) {
+      resultSet.add(word);
     }
   }
-  
-  return results.sort((a, b) => b.length - a.length || a.localeCompare(b));
+
+  // Only iterate custom dict if it's actually different from the default
+  if (customSet !== defaultDictionarySet) {
+    for (const word of customSet) {
+      if (testWordAgainstFreq(word, masterFreq, minLength, maxLength, masterWord)) {
+        resultSet.add(word);
+      }
+    }
+  }
+
+  // Large CDN dictionary (may be empty before load completes — that's fine)
+  for (const word of largeDictionarySet) {
+    if (testWordAgainstFreq(word, masterFreq, minLength, maxLength, masterWord)) {
+      resultSet.add(word);
+    }
+  }
+
+  return Array.from(resultSet).sort((a, b) => b.length - a.length || a.localeCompare(b));
 };
 
 export const getMinWordLength = (): number => {
@@ -450,11 +507,24 @@ export const getAnalytics = (): DictionaryAnalytics => {
   return { rejectedWords: {}, userComplaints: {}, attemptedWords: {} };
 };
 
-export const saveAnalytics = (analytics: DictionaryAnalytics) => {
+/** In-memory analytics buffer — flushed to localStorage at most once per 2 seconds. */
+let analyticsBuffer: DictionaryAnalytics | null = null;
+let analyticsFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+const flushAnalytics = () => {
+  if (!analyticsBuffer) return;
   try {
-    localStorage.setItem(STORAGE_ANALYTICS_KEY, JSON.stringify(analytics));
+    localStorage.setItem(STORAGE_ANALYTICS_KEY, JSON.stringify(analyticsBuffer));
   } catch (e) {
     console.error("Failed to save dictionary analytics", e);
+  }
+  analyticsFlushTimer = null;
+};
+
+export const saveAnalytics = (analytics: DictionaryAnalytics) => {
+  analyticsBuffer = analytics;
+  if (!analyticsFlushTimer) {
+    analyticsFlushTimer = setTimeout(flushAnalytics, 2000);
   }
 };
 
@@ -464,19 +534,12 @@ export const saveAnalytics = (analytics: DictionaryAnalytics) => {
 export const logWordAttempt = (word: string, isValid: boolean, reason: string = "", source: string = "") => {
   const norm = word.toUpperCase().trim();
   if (!norm) return;
-  
   const analytics = getAnalytics();
   analytics.attemptedWords[norm] = (analytics.attemptedWords[norm] || 0) + 1;
-  
   if (!isValid) {
     const current = analytics.rejectedWords[norm] || { count: 0, lastReason: "", source: "" };
-    analytics.rejectedWords[norm] = {
-      count: current.count + 1,
-      lastReason: reason,
-      source: source || "Default Constraint"
-    };
+    analytics.rejectedWords[norm] = { count: current.count + 1, lastReason: reason, source: source || "Default Constraint" };
   }
-  
   saveAnalytics(analytics);
 };
 
@@ -486,15 +549,9 @@ export const logWordAttempt = (word: string, isValid: boolean, reason: string = 
 export const logUserComplaint = (word: string) => {
   const norm = word.toUpperCase().trim();
   if (!norm) return;
-  
   const analytics = getAnalytics();
   const current = analytics.userComplaints[norm] || { count: 0, timestamp: 0 };
-  
-  analytics.userComplaints[norm] = {
-    count: current.count + 1,
-    timestamp: Date.now()
-  };
-  
+  analytics.userComplaints[norm] = { count: current.count + 1, timestamp: Date.now() };
   saveAnalytics(analytics);
   console.log(`[Analytics] Received complaint for "${norm}". Complaint count is now ${analytics.userComplaints[norm].count}`);
 };
@@ -511,6 +568,5 @@ export const clearAnalytics = () => {
  * Determine loaded dictionary size metric
  */
 export const getLoadedDictionarySize = (): number => {
-  // Return sum of localized and background set size
   return getActiveDictionary().length + largeDictionarySet.size;
 };

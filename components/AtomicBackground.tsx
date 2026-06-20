@@ -4,7 +4,8 @@ interface AtomicBackgroundProps {
   darkMode: boolean;
 }
 
-const AtomicBackground: React.FC<AtomicBackgroundProps> = ({ darkMode }) => {
+// React.memo wraps the component — type is inferred from the generic parameter
+const AtomicBackground = React.memo<AtomicBackgroundProps>(({ darkMode }) => {
   // Generate random letters for the background wallpaper texture
   const letters = useMemo(() => {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -45,6 +46,6 @@ const AtomicBackground: React.FC<AtomicBackgroundProps> = ({ darkMode }) => {
       }`} />
     </div>
   );
-};
+});
 
 export default AtomicBackground;
